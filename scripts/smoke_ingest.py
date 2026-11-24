@@ -10,6 +10,8 @@ from datetime import UTC, datetime, timedelta
 
 import httpx
 
+from opslens.config import get_settings
+
 API = "http://localhost:8000"
 VL = "http://localhost:9428"
 LINES = 5000
@@ -44,7 +46,8 @@ def build_log() -> bytes:
 
 def main() -> None:
     body = build_log()
-    with httpx.Client(timeout=60) as http:
+    headers = {"Authorization": f"Bearer {get_settings().api_token}"}
+    with httpx.Client(timeout=60, headers=headers) as http:
         upload = http.post(
             f"{API}/uploads",
             json={"filename": "smoke.log.gz", "content_type": "application/gzip"},

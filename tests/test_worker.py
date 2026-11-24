@@ -18,7 +18,14 @@ class FakeRedis:
 @pytest.fixture
 def env(monkeypatch):
     updates: list[dict] = []
-    job = {"id": "job-1", "status": "queued", "attempts": 0, "stats": {}, "object_key": "k"}
+    job = {
+        "id": "job-1",
+        "status": "queued",
+        "attempts": 0,
+        "stats": {},
+        "object_key": "k",
+        "kind": "logs",
+    }
 
     async def fake_job(resources, job_id):
         return dict(job)
@@ -39,7 +46,7 @@ async def test_success_marks_done_and_acks(monkeypatch, env):
 
     monkeypatch.setattr(worker, "process_job", ok)
 
-    await worker.handle(resources, None, "1-0", {"job_id": "job-1"})
+    await worker.handle(resources, None, None, "1-0", {"job_id": "job-1"})
 
     assert resources.redis.acked == ["1-0"]
     assert updates[-1] == {
@@ -56,7 +63,7 @@ async def test_failure_requeues_without_ack(monkeypatch, env):
 
     monkeypatch.setattr(worker, "process_job", boom)
 
-    await worker.handle(resources, None, "1-0", {"job_id": "job-1"})
+    await worker.handle(resources, None, None, "1-0", {"job_id": "job-1"})
 
     assert resources.redis.acked == []  # pending entry is retried by XAUTOCLAIM
     assert updates[-1]["status"] == "queued"
@@ -68,7 +75,7 @@ async def test_dead_after_max_attempts(monkeypatch, env):
     resources, updates = env
     resources.job["attempts"] = worker.MAX_ATTEMPTS
 
-    await worker.handle(resources, None, "1-0", {"job_id": "job-1"})
+    await worker.handle(resources, None, None, "1-0", {"job_id": "job-1"})
 
     assert resources.redis.acked == ["1-0"]
     assert updates[-1] == {"status": "dead", "error": "max attempts exceeded"}
@@ -83,7 +90,29 @@ async def test_finished_job_is_acked_without_work(monkeypatch, env):
 
     monkeypatch.setattr(worker, "process_job", must_not_run)
 
-    await worker.handle(resources, None, "1-0", {"job_id": "job-1"})
+    await worker.handle(resources, None, None, "1-0", {"job_id": "job-1"})
 
     assert resources.redis.acked == ["1-0"]
     assert updates == []
+
+
+async def test_knowledge_job_uses_the_document_path(monkeypatch, env):
+    resources, updates = env
+    resources.job["kind"] = "runbook"
+    calls: list[str] = []
+
+    async def knowledge(*_args, **_kwargs):
+        calls.append("knowledge")
+        return {"chunks": 3}
+
+    async def logs(*_args, **_kwargs):
+        calls.append("logs")
+        return {}
+
+    monkeypatch.setattr(worker, "process_knowledge_job", knowledge)
+    monkeypatch.setattr(worker, "process_job", logs)
+
+    await worker.handle(resources, None, None, "1-0", {"job_id": "job-1"})
+
+    assert calls == ["knowledge"]
+    assert updates[-1] == {"status": "done", "stats": {"chunks": 3}}

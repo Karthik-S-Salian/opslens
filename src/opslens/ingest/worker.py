@@ -5,15 +5,19 @@ from __future__ import annotations
 import asyncio
 import gzip
 import logging
+import re
 import socket
 from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 import orjson
 from redis.exceptions import ResponseError
 from sqlalchemy import text
 
+from opslens.agent.llm import OllamaLLM
 from opslens.config import Settings, get_settings
+from opslens.ingest.docs import chunk
 from opslens.ingest.parse import LineAssembler
 from opslens.ingest.redact import redact
 from opslens.ingest.vl import VictoriaLogs
@@ -28,6 +32,8 @@ BATCH = 1000
 CHUNK = 1 << 20
 MAX_ATTEMPTS = 3
 CLAIM_IDLE_MS = 60_000
+MAX_DOC_BYTES = 20 * 1024 * 1024
+EMBED_BATCH = 16
 
 
 class PrefixedReader:
@@ -109,6 +115,84 @@ async def process_job(
     return stats
 
 
+def _doc_key(kind: str, service: str | None, title: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:120] or "untitled"
+    return f"{kind}:{service or '-'}:{slug}"
+
+
+async def process_knowledge_job(
+    resources: Resources, llm: OllamaLLM, job: dict[str, Any]
+) -> dict[str, int]:
+    defaults = (job["stats"] or {}).get("defaults") or {}
+    title = defaults.get("title") or job["object_key"].rsplit("/", 1)[-1]
+    service = defaults.get("service")
+    size = int((job["stats"] or {}).get("bytes") or 0)
+    if size > MAX_DOC_BYTES:
+        raise ValueError(f"document is {size} bytes, limit is {MAX_DOC_BYTES}")
+
+    body = (
+        await asyncio.to_thread(
+            resources.s3.get_object, Bucket=resources.settings.s3_bucket, Key=job["object_key"]
+        )
+    )["Body"]
+    raw = await asyncio.to_thread(body.read)
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    text_value = raw.decode("utf-8", "replace")
+    pieces = chunk(text_value)
+    if not pieces:
+        raise ValueError("document has no text")
+
+    embeddings: list[list[float]] = []
+    for start in range(0, len(pieces), EMBED_BATCH):
+        embeddings.extend(await llm.embed(pieces[start : start + EMBED_BATCH]))
+
+    source_key = _doc_key(job["kind"], service, title)
+    async with resources.db.begin() as conn:
+        document_id = (
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO documents (org_id, kind, title, service, source_key)
+                    VALUES (:org, :kind, :title, :service, :key)
+                    ON CONFLICT (org_id, source_key) DO UPDATE SET
+                        title = EXCLUDED.title, service = EXCLUDED.service,
+                        kind = EXCLUDED.kind, metadata = documents.metadata
+                    RETURNING id
+                    """
+                ),
+                {
+                    "org": resources.settings.org_id,
+                    "kind": job["kind"],
+                    "title": title,
+                    "service": service,
+                    "key": source_key,
+                },
+            )
+        ).scalar_one()
+        await conn.execute(
+            text("DELETE FROM doc_chunks WHERE document_id = :id"), {"id": document_id}
+        )
+        for index, (piece, embedding) in enumerate(zip(pieces, embeddings, strict=True)):
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO doc_chunks
+                        (document_id, org_id, chunk_index, content, embedding)
+                    VALUES (:doc, :org, :idx, :content, CAST(:vec AS halfvec))
+                    """
+                ),
+                {
+                    "doc": document_id,
+                    "org": resources.settings.org_id,
+                    "idx": index,
+                    "content": piece,
+                    "vec": "[" + ",".join(f"{v:.6f}" for v in embedding) + "]",
+                },
+            )
+    return {"chunks": len(pieces), "chars": len(text_value)}
+
+
 async def _update_job(resources: Resources, job_id: Any, **fields: Any) -> None:
     params: dict[str, Any] = {}
     assignments: list[str] = []
@@ -132,7 +216,7 @@ async def _job(resources: Resources, job_id: str) -> dict[str, Any] | None:
             (
                 await conn.execute(
                     text(
-                        "SELECT id, status, attempts, stats, object_key"
+                        "SELECT id, status, attempts, stats, object_key, kind"
                         " FROM ingest_jobs WHERE id = :id"
                     ),
                     {"id": job_id},
@@ -145,7 +229,7 @@ async def _job(resources: Resources, job_id: str) -> dict[str, Any] | None:
 
 
 async def handle(
-    resources: Resources, vl: VictoriaLogs, entry_id: str, fields: dict[str, str]
+    resources: Resources, vl: VictoriaLogs, llm: OllamaLLM, entry_id: str, fields: dict[str, str]
 ) -> None:
     job_id = fields.get("job_id")
     if not job_id:
@@ -166,7 +250,10 @@ async def handle(
 
     await _update_job(resources, job_id, status="running", attempts=attempts, error=None)
     try:
-        stats = await process_job(resources, vl, job)
+        if job["kind"] == "logs":
+            stats = await process_job(resources, vl, job)
+        else:
+            stats = await process_knowledge_job(resources, llm, job)
     except Exception as exc:  # noqa: BLE001 - retried via the pending list, then dead
         await _update_job(
             resources, job_id, status="queued", error=f"{type(exc).__name__}: {exc}"[:500]
@@ -182,6 +269,8 @@ async def run(settings: Settings | None = None) -> None:
     settings = settings or get_settings()
     resources = Resources.build(settings)
     vl = VictoriaLogs(resources.http)
+    ollama = httpx.AsyncClient(base_url=settings.ollama_url, timeout=settings.llm_timeout_seconds)
+    llm = OllamaLLM(ollama, settings.chat_model, settings.embed_model)
     try:
         try:
             await resources.redis.xgroup_create(STREAM, GROUP, id="0", mkstream=True)
@@ -196,19 +285,20 @@ async def run(settings: Settings | None = None) -> None:
                     STREAM, GROUP, CONSUMER, min_idle_time=CLAIM_IDLE_MS, start_id="0-0", count=10
                 )
                 for entry_id, fields in claimed:
-                    await handle(resources, vl, entry_id, fields)
+                    await handle(resources, vl, llm, entry_id, fields)
 
                 response = await resources.redis.xreadgroup(
                     GROUP, CONSUMER, {STREAM: ">"}, count=5, block=5000
                 )
                 for _, entries in response or []:
                     for entry_id, fields in entries:
-                        await handle(resources, vl, entry_id, fields)
+                        await handle(resources, vl, llm, entry_id, fields)
             except Exception:  # noqa: BLE001 - a Redis blip must not kill the consumer
                 log.exception("consumer loop error; retrying")
                 await asyncio.sleep(2)
     finally:
         await resources.aclose()
+        await ollama.aclose()
 
 
 def main() -> None:

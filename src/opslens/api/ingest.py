@@ -33,16 +33,20 @@ def safe_object_key(filename: str) -> str:
     return f"uploads/{uuid.uuid4()}/{name}"
 
 
+UploadKind = Literal["logs", "runbook", "postmortem"]
+
+
 class UploadRequest(BaseModel):
     filename: str = Field(min_length=1, max_length=255)
-    kind: Literal["logs"] = "logs"
+    kind: UploadKind = "logs"
     content_type: str = "application/octet-stream"
 
 
 class UploadComplete(BaseModel):
-    kind: Literal["logs"] = "logs"
+    kind: UploadKind = "logs"
     service: str | None = None
     env: str | None = None
+    title: str | None = Field(default=None, max_length=300)
 
 
 class DeploymentIn(BaseModel):
@@ -77,6 +81,10 @@ async def complete_upload(key: str, body: UploadComplete, request: Request) -> d
     resources = _resources(request)
     if not UPLOAD_KEY.match(key):
         raise HTTPException(status_code=400, detail="invalid upload key")
+    if body.kind != "logs" and not body.title:
+        raise HTTPException(
+            status_code=422, detail="title is required for runbooks and postmortems"
+        )
 
     try:
         head = await asyncio.to_thread(
@@ -91,7 +99,11 @@ async def complete_upload(key: str, body: UploadComplete, request: Request) -> d
         )
         raise HTTPException(status_code=413, detail="upload exceeds max_upload_bytes")
 
-    defaults = {k: v for k, v in {"service": body.service, "env": body.env}.items() if v}
+    defaults = {
+        k: v
+        for k, v in {"service": body.service, "env": body.env, "title": body.title}.items()
+        if v
+    }
     async with resources.db.begin() as conn:
         job_id = (
             await conn.execute(
