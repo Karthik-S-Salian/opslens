@@ -1,26 +1,32 @@
 # OpsLens
 
-OpsLens investigates production incidents. You give it an incident, it reads your logs, traces,
-recent deploys and runbooks, and tells you what broke — citing the evidence it used, so you can
+OpsLens helps you work out why production is failing. Give it an incident, and it reads your logs,
+traces, recent deploys and runbooks, then reports what it found — citing the evidence so you can
 check its work.
 
-It is meant for the first twenty minutes of an outage, when the error rate is climbing and nobody
-has worked out yet whether this is a bad deploy, a saturated connection pool, or one noisy
-dependency. You watch it think, interrupt it when it heads somewhere useless, and ask follow-ups
-on the same evidence.
+It's built for the first twenty minutes of an outage: you start it, watch which queries it runs,
+and steer it if it heads somewhere useless. Follow-up questions stay on the same evidence.
 
 ```
-incident ──► agent loop ──► search_logs ──► VictoriaLogs
-                │           fetch_trace  ──► VictoriaLogs
-                │           list_deployments, search_runbooks
-                │           search_past_incidents ──► Postgres (pgvector + FTS)
+incident ──► agent loop ──► search_logs, fetch_trace ──► VictoriaLogs
+                │            list_deployments ─────────► Postgres
+                │            search_runbooks ──────────► Postgres (pgvector + FTS)
                 ▼
           run_events ──► SSE ──► workspace UI
 ```
 
-## Running it
+## Requirements
 
-You need Docker (OrbStack or Docker Desktop) and [uv](https://docs.astral.sh/uv/).
+- Docker (OrbStack or Docker Desktop)
+- [uv](https://docs.astral.sh/uv/)
+- [Ollama](https://ollama.com/) with two models:
+
+```bash
+ollama pull qwen3:8b     # chat and tool calling
+ollama pull bge-m3       # embeddings, 1024 dimensions
+```
+
+## Quick start
 
 ```bash
 cp .env.example .env
@@ -28,112 +34,95 @@ docker compose up --build -d
 open http://localhost:8000
 ```
 
-The UI asks for a token. The default is `dev-token`, set by `API_TOKEN` in `compose.yaml` — change
-it before anyone else can reach the port.
+The UI asks for a bearer token. The default is `dev-token`; set `API_TOKEN` in `compose.yaml` to
+change it.
 
-`/healthz` tells you which dependency is unhappy:
-
-```json
-{"status":"ok","checks":{"postgres":{"ok":true},"redis":{"ok":true},
-                         "victorialogs":{"ok":true},"s3":{"ok":true}}}
-```
-
-Models run locally through Ollama. Install it, then:
-
-```bash
-ollama pull qwen3:8b     # chat + tool calling
-ollama pull bge-m3       # embeddings, 1024 dims
-```
-
-The API reaches Ollama at `host.docker.internal:11434`. If you change the embedding model, check its
-dimension first: `doc_chunks.embedding` is `halfvec(1024)`, so a 768-dim model needs a migration.
+`GET /healthz` returns 200 when Postgres, Redis, VictoriaLogs and object storage all answer, and 503
+with the failing dependency named.
 
 ## Using it
 
-Create an incident in the UI and ask a question. Or do it from the shell:
+Create an incident in the UI, then ask a question. The run streams back as it happens: the queries
+the agent runs, its reasoning, and the answer with a citation chip on every claim. Click a chip to
+see the rows behind it. While a run is active you can send it an instruction — it is applied before
+the next step, or interrupts the current answer — or stop the run and keep what it had already
+established.
 
-```bash
-TOKEN='Authorization: Bearer dev-token'
+Endpoints, if you want to drive it without the UI:
 
-INC=$(curl -s -XPOST localhost:8000/incidents -H "$TOKEN" -H 'content-type: application/json' \
-  -d '{"title":"payment 5xx","severity":"sev2","services":["payment"]}' | jq -r .id)
+| Method | Path | Purpose |
+|---|---|---|
+| `POST` | `/incidents` | create an incident |
+| `POST` | `/incidents/{id}/runs` | start an investigation |
+| `GET` | `/runs/{id}/events` | SSE stream; send `Last-Event-ID` to resume |
+| `POST` | `/runs/{id}/steer` | send an instruction (`interrupt` stops generation) |
+| `POST` | `/runs/{id}/cancel` | stop the run |
+| `GET` | `/incidents/{id}/timeline` | messages and runs for an incident |
+| `GET` | `/evidence/{id}` | the stored tool result behind a citation |
+| `POST` | `/uploads` | presigned log upload |
+| `POST` | `/uploads/{key}/complete` | queue the uploaded file for ingest |
+| `GET` | `/jobs/{id}` | ingest progress |
+| `POST` | `/webhooks/deployments` | record a deploy |
 
-RUN=$(curl -s -XPOST localhost:8000/incidents/$INC/runs -H "$TOKEN" -H 'content-type: application/json' \
-  -d '{"question":"Why is payment failing since 10:36?"}' | jq -r .run_id)
+All of them except `/healthz` want `Authorization: Bearer <API_TOKEN>`.
 
-curl -N localhost:8000/runs/$RUN/events -H "$TOKEN"
-```
+## Getting data in
 
-While a run is going you can push it in a different direction:
+Logs are uploaded directly to object storage: the API hands out a presigned URL, you `PUT` the file
+there, then confirm it. The API never reads the body. A background worker streams the file back line
+by line — gzip, JSON lines, Docker's json-file format, OTel JSON or plain text — joins stack traces
+into single records, removes credentials, and writes batches to VictoriaLogs.
 
-```bash
-curl -s -XPOST localhost:8000/runs/$RUN/steer -H "$TOKEN" -H 'content-type: application/json' \
-  -d '{"text":"skip auth retries, check the 10:36 deploy","interrupt":true}'
+Deploys come in through the webhook endpoint and are deduplicated on
+`(org, source, external_id)`, so CI retries are harmless.
 
-curl -s -XPOST localhost:8000/runs/$RUN/cancel -H "$TOKEN"
-```
+Runbooks and postmortems use the same upload flow with `"kind": "runbook"` (or `postmortem`) and a
+`title`. The worker chunks and embeds them, so retrieval picks them up straight away.
 
-`interrupt` cuts the current generation short; the instruction is picked up before the next step.
-`cancel` stops the run and keeps whatever it had already concluded.
+## How the investigation works
 
-### Getting data in
+Before calling the model, the server runs two queries itself — error counts per service and recent
+deploys — and puts them in context.
 
-Logs go in three ways: an upload, a deploy webhook, and (eventually) an OTel collector.
+The model then calls tools. It does not write queries: it passes fields like `service`, `severity`,
+`trace_id` and `minutes_ago`, and the server builds and escapes the LogsQL. Tool output and uploaded
+documents are treated as data; instructions inside a log line are reported, not followed.
 
-```bash
-# 1. ask for a presigned upload, PUT the file straight to object storage, then confirm
-curl -s -XPOST localhost:8000/uploads -H "$TOKEN" -H 'content-type: application/json' \
-  -d '{"filename":"api.log.gz","content_type":"application/gzip"}'
-#    → { "key": "uploads/…", "url": "http://localhost:8333/…" }
-#    PUT the file to that url, then:
-curl -s -XPOST "localhost:8000/uploads/<key>/complete" -H "$TOKEN" -H 'content-type: application/json' \
-  -d '{"service":"api","env":"prod"}'
-curl -s localhost:8000/jobs/<job_id> -H "$TOKEN"
-```
+Each tool result is stored as evidence with an id, and the model has to cite it. Citations are
+checked afterwards: abbreviated ids resolve to the full uuid, invented ones become `[ev:unknown]`.
 
-The API never touches the file body. The worker streams it out of object storage line by line —
-gzip, JSON-lines, Docker's json-file format, OTel JSON or plain text — joins stack traces back into
-single records, strips credentials, and pushes batches into VictoriaLogs.
+Runs are bounded by a budget (8 steps, 14 tool calls, 300 seconds by default) and stop with a clear
+status when they hit it.
 
-```bash
-# 2. deploy webhook, idempotent on (org, source, external_id)
-curl -s -XPOST localhost:8000/webhooks/deployments -H "$TOKEN" -H 'content-type: application/json' \
-  -H 'X-Delivery-Id: run-123' \
-  -d '{"service":"payment","env":"prod","version":"1.9.4","deployed_at":"2026-11-24T10:20:00Z"}'
-```
+## Configuration
 
-Runbooks and postmortems are the weak spot right now: retrieval works, but documents still get in
-through `scripts/seed_docs.py` rather than the upload endpoint.
+All settings are environment variables; see `.env.example` for the local defaults.
 
-## What the agent actually does
-
-Before the first model call it does two cheap queries itself — error counts per service and recent
-deploys — and puts the result in context. That way a small local model doesn't burn four turns
-rediscovering the onset time.
-
-The model then calls tools. It never writes LogsQL: it passes `service`, `severity`, `trace_id`,
-`minutes_ago` and so on, and the server composes and escapes the query. Logs and uploaded runbooks
-are untrusted text, so instructions hidden inside a log line are treated as content, not commands.
-
-Every tool result is registered as evidence with an id. The model has to cite it, and citations are
-checked afterwards: short ids get resolved to the full uuid, ids that never existed become
-`[ev:unknown]`. The UI turns each citation into a chip you can click to see the underlying rows.
-
-Budgets are hard: 8 steps, 14 tool calls, 300 seconds per run. When one is hit the run stops and
-says so instead of looping.
+| Variable | Default | Notes |
+|---|---|---|
+| `API_TOKEN` | `dev-token` | empty string disables auth |
+| `DATABASE_URL` | `postgresql+asyncpg://opslens:opslens@localhost:5432/opslens` | |
+| `REDIS_URL` | `redis://localhost:6379/0` | |
+| `VICTORIALOGS_URL` | `http://localhost:9428` | |
+| `S3_ENDPOINT_URL` | `http://localhost:8333` | internal endpoint |
+| `S3_PUBLIC_ENDPOINT_URL` | same as above | used for signing; must be reachable from the client |
+| `S3_BUCKET` | `opslens` | created at startup if missing |
+| `OLLAMA_URL` | `http://localhost:11434` | in compose: `host.docker.internal:11434` |
+| `CHAT_MODEL` | `qwen3:8b` | |
+| `EMBED_MODEL` | `bge-m3` | must match `doc_chunks.embedding halfvec(1024)` |
 
 ## Layout
 
 ```
 src/opslens/
   api/      FastAPI: health, uploads, incidents, runs, SSE
-  agent/    LLM client, tools, evidence registry, the loop
-  ingest/   parsers, redaction, VictoriaLogs client, redis worker
+  agent/    LLM client, tools, evidence registry, the run loop
+  ingest/   parsers, redaction, VictoriaLogs client, Redis worker
   store/    shared clients
-  web/      the UI (plain HTML/CSS/JS, no build step)
-migrations/ Alembic — the schema's source of truth
+  web/      UI (plain HTML/CSS/JS, no build step)
+migrations/ Alembic; migrations are the schema's source of truth
 scripts/    smoke tests and demo data
-tests/      unit tests; nothing here needs Docker or a model
+tests/      unit tests; no Docker or model required
 ```
 
 ## Tests
@@ -143,35 +132,13 @@ uv run pytest -q
 uv run ruff check . && uv run ruff format --check .
 ```
 
-The interesting checks need the stack up, because they exercise the real services:
+The end-to-end checks need the stack running:
 
 ```bash
-uv run python scripts/smoke_ingest.py   # 5k log lines end to end, tracebacks joined, secrets redacted
-uv run python scripts/seed_docs.py      # runbook/postmortem chunks + demo deploys
-uv run python scripts/smoke_agent.py    # scripted LLM through the real loop, no model needed
-uv run python scripts/smoke_live.py     # qwen3:8b, real tool calls, real citations
+uv run python scripts/smoke_ingest.py   # 5k log lines through ingest into VictoriaLogs
+uv run python scripts/seed_docs.py      # runbook and postmortem chunks, plus demo deploys
+uv run python scripts/smoke_agent.py    # scripted model through the real loop
+uv run python scripts/smoke_knowledge.py  # upload a runbook, then retrieve it lexically and semantically
+uv run python scripts/eval_agent.py     # qwen3:8b, scores grounding and citation resolvability
+uv run python scripts/smoke_live.py     # one live run, printed end to end
 ```
-
-## Things that bit me, so they don't bite you
-
-**Presigned URLs need a second client.** SigV4 signs the `Host` header, so a URL signed against
-`s3:8333` is useless to your browser. `S3_PUBLIC_ENDPOINT_URL` is a separate boto3 client used only
-for signing.
-
-**redis-py 8 defaults to a 5-second socket timeout,** which is exactly the `XREADGROUP block=5000`
-the worker uses. The worker died on its first idle read until that was raised.
-
-**Runs live in the API process.** A restart marks in-flight runs failed instead of leaving them
-stuck in `running`. Moving the loop into the worker process is the fix if this ever needs to
-survive a deploy mid-investigation — right now it's a dev-grade trade for keeping cancel simple.
-
-**SSE reads Postgres, not Redis.** `run_events.seq` is the resume cursor, so Redis would just be a
-second copy of the truth. It polls every 250 ms, which is fine for one API instance and the wrong
-shape for ten.
-
-## What's missing
-
-Follow-up runs reuse the previous run's last eight messages, which is honest but shallow. Retrieval
-is fused with RRF and untuned. There is no reranker, no compaction of long investigations, no
-evaluation set beyond the three smoke scripts, and no live log shipping. The UI has no
-reconnect-on-reload for a run that started before you opened the page.
