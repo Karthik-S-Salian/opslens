@@ -53,9 +53,8 @@ services:
     volumes:
       - vldata:/vlogs
 
-  # SeaweedFS: real S3-compatible storage, 280MB, actively released, survives restarts.
-  # LocalStack 4.14.0 also passes the ingest flow (see README) but is 1.65GB, its newer
-  # images require a license token, and community S3 state did not survive a restart.
+  # S3-compatible object store for raw uploads. Swap the image for anything that speaks S3
+  # (real S3, MinIO, LocalStack) and point S3_ENDPOINT_URL / S3_PUBLIC_ENDPOINT_URL at it.
   s3:
     image: chrislusf/seaweedfs:latest
     command: ["server", "-s3", "-s3.port=8333", "-ip.bind=0.0.0.0", "-dir=/data"]
