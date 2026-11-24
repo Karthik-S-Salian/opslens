@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>OpsLens</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+<header>
+  <div class="brand">Ops<span>Lens</span></div>
+  <div class="spacer"></div>
+  <input id="token" type="password" placeholder="bearer token" aria-label="bearer token" />
+  <span id="conn" class="dot" title="connection"></span>
+</header>
+
+<main>
+  <aside>
+    <button id="new-incident" class="primary">+ New incident</button>
+    <form id="incident-form" class="hidden">
+      <input id="inc-title" placeholder="API 5xx spike on payment" required />
+      <div class="row">
+        <select id="inc-severity">
+          <option>sev1</option><option>sev2</option><option selected>sev3</option><option>unknown</option>
+        </select>
+        <input id="inc-services" placeholder="payment, auth" />
+      </div>
+      <button class="primary" type="submit">Create</button>
+    </form>
+    <ul id="incidents"></ul>
+  </aside>
+
+  <section id="workspace">
+    <div id="empty" class="empty">Pick or create an incident.</div>
+    <div id="incident-panel" class="hidden">
+      <h1 id="incident-title"></h1>
+      <div id="incident-meta" class="muted"></div>
+
+      <div id="timeline"></div>
+
+      <form id="run-form" class="composer">
+        <textarea id="question" rows="2" placeholder="Why is payment failing since 10:36?"></textarea>
+        <div class="row">
+          <button class="primary" id="run-btn" type="submit">Investigate</button>
+          <button id="stop-btn" type="button" class="danger hidden">Stop</button>
+          <input id="steer" placeholder="Steer mid-run: skip auth retries, check the 10:36 deploy" />
+          <button id="steer-btn" type="button" class="hidden">Steer</button>
+        </div>
+      </form>
+    </div>
+  </section>
+
+  <aside id="evidence" class="hidden">
+    <div class="row"><strong>Evidence</strong><button id="close-evidence" class="ghost">×</button></div>
+    <pre id="evidence-body"></pre>
+  </aside>
+</main>
+<script src="/app.js"></script>
+</body>
+</html>
